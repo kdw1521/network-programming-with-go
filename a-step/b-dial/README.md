@@ -66,7 +66,7 @@ func TestDialTimeout(t *testing.T) {
 func TestDialContext(t *testing.T) {
 	dl := time.Now().Add(5 * time.Second) // 5초의 데드라인 설정
 	ctx, cancel := context.WithDeadline(context.Background(), dl) // 데드라인을 갖는 ctx 생성
-	defer cancel() // 함수 종료 시 cancel 호출해 ctx 해
+	defer cancel() // 함수 종료 시 cancel 호출해 ctx 해제
 
 	var d net.Dialer
 	d.Control = func(_, _ string, _ syscall.RawConn) error {
@@ -199,6 +199,91 @@ func TestDialContextCancelFanOut(t *testing.T) {
 }
 ```
 
+### 5. 데드라인 구현하기
+```go
+func TestDeadline(t *testing.T) {
+    sync := make(chan struct{}) // 동기화를 위한 채널
+
+    listener, err := net.Listen("tcp", "127.0.0.1:")
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    go func() {
+        conn, err := listener.Accept()
+        if err != nil {
+            t.Log(err)
+            return
+        }
+        defer func() {
+            err := conn.Close()
+            if err != nil {
+                t.Log(err)
+            }
+            close(sync) // 이른 return 으로 인해 sync 채널에서 읽는 데이터가 블로킹되면 안됨
+        }()
+
+        err = conn.SetDeadline(time.Now().Add(5 * time.Second)) // 읽기, 쓰기에 5초의 타임아웃 설정
+        if err != nil {
+            t.Error(err)
+            return
+        }
+
+        buf := make([]byte, 1)
+        _, err = conn.Read(buf) // 원격 노드가 데이터를 보낼 때까지 블로킹됨
+        nErr, ok := err.(net.Error)
+        if !ok || !nErr.Timeout() {
+            t.Errorf("expected timeout error; actual: %v", err)
+        }
+
+        sync <- struct{}{} // 메인에서 write 작업을 하도록 허용
+
+        err = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+        if err != nil {
+            t.Error(err)
+            return
+        }
+
+        _, err = conn.Read(buf)
+        if err != nil {
+        t.Error(err)
+        }
+    }()
+
+    conn, err := net.Dial("tcp", listener.Addr().String()) // 리스너에 연결 시도
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer conn.Close()
+
+    <-sync // 채널에서 신호 대기
+    _, err = conn.Write([]byte("1"))
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    buf := make([]byte, 1)
+    _, err = conn.Read(buf)
+    if err != io.EOF {
+        t.Errorf("expected server termination; actual: %v", err)
+    }
+}
+/*
+코드 흐름
+
+서버 측 고루틴
+1. 클라이언트 연결 대기
+2. 연결 성공시 5초 후 타임아웃 발생하도록 설정
+3. conn.Read 로 클라이언트가 데이터를 보낼때 까지 대기, 이때 클라이언트가 보내지 않는다면 5초후 타임아웃 발생
+4. 타임아웃 오류 발생 시 sync 채널에 신호를 보내고 다시 타임아웃 설정 후 데이터 수신 대기
+
+메인 고루틴
+1. 리스너 연결
+2. sync 채널에 신호 대기
+3. 신호 받은 뒤 1 데이터 전송
+4. 서버로 부터 데이터를 읽은 후 연결이 종료됨을 확인 - io.EOF
+*/
+```
 ---
 
 ## 개인적 고찰 (왜? WHY?)
